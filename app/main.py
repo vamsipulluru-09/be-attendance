@@ -1,28 +1,29 @@
-import psycopg2
-import numpy as np
-from typing import List, Dict, Optional
-from psycopg2.extras import execute_values
-from fastapi import FastAPI, UploadFile, File, Form, Request
-from fastapi.middleware.cors import CORSMiddleware
-from .face_processor import FaceProcessor
-from .face_vector import FaceEmbeddingDB
-import cv2
-import tempfile
 import os
-import face_recognition
+import numpy as np
+import cv2
 import math
-from fastapi import HTTPException
-import hashlib
+import tempfile
 import re
-from dotenv import load_dotenv
-from datetime import datetime, timedelta
+import hashlib
 import smtplib
+import io
+import csv
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from insightface.app import FaceAnalysis
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from psycopg2 import OperationalError
+from .face_processor import FaceProcessor
+from .face_vector import FaceEmbeddingDB
 
 load_dotenv()
 
+# Environment variables validation
 MAX_DISTANCE = os.getenv('MAX_DISTANCE')
 if not MAX_DISTANCE:
     raise ValueError("Missing required environment variable: MAX_DISTANCE")
@@ -37,14 +38,13 @@ app = FastAPI()
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        os.getenv("APP_URL")
-    ],
+    allow_origins=[os.getenv("APP_URL")],
     allow_credentials=True,
     allow_methods=["*"],  
     allow_headers=["*"],
 )
 
+# Database configuration
 db_params = {
     'dbname': os.getenv('DB_NAME'),
     'user': os.getenv('DB_USER'),
@@ -65,12 +65,12 @@ db_handler = FaceEmbeddingDB(db_params)
 # Initialize face processor
 face_processor = FaceProcessor(db_handler)
 
+# Initialize InsightFace model globally
+face_app = FaceAnalysis(providers=['CPUExecutionProvider'])
+face_app.prepare(ctx_id=0, det_size=(640, 640))
+
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """
-    Calculate the great circle distance between two points
-    on the earth (specified in decimal degrees).
-    Returns distance in meters.
-    """
+    """Calculate the great circle distance between two points on earth in meters."""
     # Convert decimal degrees to radians
     lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
     
@@ -82,23 +82,110 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371000  # Radius of earth in meters
     return c * r
 
+def extract_face_embedding_from_bytes(image_bytes: bytes) -> Optional[np.ndarray]:
+    """Extract face embedding from image bytes using InsightFace."""
+    try:
+        # Convert bytes to numpy array
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            return None
+            
+        faces = face_app.get(img)
+        if not faces:
+            return None
+            
+        return faces[0].embedding
+        
+    except Exception as e:
+        print(f"Error extracting face embedding from bytes: {e}")
+        return None
+
+def extract_face_embedding_from_file(image_path: str) -> Optional[np.ndarray]:
+    """Extract face embedding from an image file using InsightFace."""
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            return None
+            
+        faces = face_app.get(img)
+        if not faces:
+            return None
+            
+        return faces[0].embedding
+        
+    except Exception as e:
+        print(f"Error extracting face embedding: {e}")
+        return None
+
+def get_session_type() -> Optional[str]:
+    """Determine session type based on current time."""
+    current_time = datetime.now().time()
+    morning_start = datetime.strptime("06:00", "%H:%M").time()
+    morning_end = datetime.strptime("12:00", "%H:%M").time()
+    afternoon_start = datetime.strptime("13:00", "%H:%M").time()
+    afternoon_end = datetime.strptime("18:00", "%H:%M").time()
+    
+    if morning_start <= current_time <= morning_end:
+        return "morning"
+    elif afternoon_start <= current_time <= afternoon_end:
+        return "afternoon"
+    else:
+        return None
+
+def process_face_verification(image_bytes: bytes, latitude: float, longitude: float, action: str):
+    """Common function to process face verification for check-in/check-out."""
+    # Extract face embedding
+    face_encoding = extract_face_embedding_from_bytes(image_bytes)
+    if face_encoding is None:
+        return {"status": "error", "message": "No face detected in the image"}
+    
+    results = db_handler.vector_search(face_encoding)
+    if not results:
+        return {"status": "error", "message": "Face not recognized"}
+    
+    best_match = results[0]
+    entity_id = best_match["entity_id"]
+    name = best_match["name"]
+    
+    employee_info = db_handler.get_employee_branch_location(entity_id)
+    if not employee_info:
+        return {"status": "error", "message": "Employee branch information not found"}
+    
+    branch_latitude = employee_info["latitude"]
+    branch_longitude = employee_info["longitude"]
+    
+    distance = haversine(latitude, longitude, branch_latitude, branch_longitude)
+    if distance > MAX_DISTANCE:
+        return {
+            "status": "error",
+            "message": f"Location verification failed. You are {int(distance)}m away from your branch."
+        }
+    
+    # Determine session type
+    session_type = get_session_type()
+    if session_type is None:
+        return {
+            "status": "error",
+            "message": f"{action.capitalize()} is only allowed during morning (6:00-12:00) or afternoon (13:00-18:00) sessions."
+        }
+    
+    return {
+        "entity_id": entity_id,
+        "name": name,
+        "employee_info": employee_info,
+        "distance": int(distance),
+        "session_type": session_type
+    }
+
 @app.post("/branch/add")
 async def add_branch(
     branch_name: str = Form(...),
     latitude: float = Form(...),
     longitude: float = Form(...)
 ):
-    """
-    Add a new branch with its geolocation.
-
-    Args:
-        branch_name: Name of the branch
-        latitude: Latitude of the branch location
-        longitude: Longitude of the branch location
-    
-    Returns:
-        Branch ID and status message
-    """
+    """Add a new branch with its geolocation."""
     try:
         branch_id = db_handler.add_branch(branch_name, latitude, longitude)
         if branch_id:
@@ -128,18 +215,7 @@ async def enroll_employee(
     branch_id: int = Form(...),
     photo: UploadFile = File(...)
 ):
-    """
-    Enroll an employee with photo, entity ID, and branch assignment.
-
-    Args:
-        entity_id: Unique identifier for the employee
-        name: Name of the employee
-        branch_id: Branch ID where employee works
-        photo: Employee photo for facial recognition
-
-    Returns:
-        Status of enrollment operation
-    """
+    """Enroll an employee with photo, entity ID, and branch assignment."""
     try:
         # Input validation
         if not entity_id or entity_id.strip() == "":
@@ -152,33 +228,22 @@ async def enroll_employee(
         entity_id = entity_id.strip()
         name = name.strip()
 
-        # Define the directory path
-        employee_images_dir = r"employee_images"
+        # Create employee images directory
+        employee_images_dir = "employee_images"
         os.makedirs(employee_images_dir, exist_ok=True)
         employee_dir = os.path.join(employee_images_dir, entity_id)
         os.makedirs(employee_dir, exist_ok=True)
 
-        # Define the path for the photo
+        # Save the uploaded photo
         photo_path = os.path.join(employee_dir, f"{entity_id}.jpg")
-
-        # Save the uploaded photo to the specified path
         with open(photo_path, "wb") as f:
             content = await photo.read()
             f.write(content)
 
-        # Generate embedding
-        image = face_recognition.load_image_file(photo_path)
-        face_encodings = face_recognition.face_encodings(image)
-        
-        if not face_encodings:
+        # Generate embedding using InsightFace
+        encoding = extract_face_embedding_from_file(photo_path)
+        if encoding is None:
             return {"status": "error", "message": "No face detected in the image"}
-        
-        encoding = face_encodings[0]
-
-        # Check if a similar embedding already exists
-        similar_embeddings = db_handler.vector_search(encoding)
-        if similar_embeddings:
-            return {"status": "error", "message": "Employee with similar face already exists"}
 
         # Store the embedding in the database with branch assignment
         success = db_handler.store_embedding(entity_id, name, encoding, branch_id)
@@ -192,90 +257,30 @@ async def enroll_employee(
 
     except Exception as e:
         return {"status": "error", "message": f"Error: {str(e)}"}
-    
+
 @app.post("/verify-face")
 async def verify_face(
     photo: UploadFile = File(...),
     latitude: float = Form(...),
     longitude: float = Form(...)
 ):
-    """
-    Verify a face against stored embeddings and check location against employee's branch.
-
-    Args:
-        photo: The photo to verify
-        latitude: Current latitude of the employee
-        longitude: Current longitude of the employee
-
-    Returns:
-        Verification status and employee details if successful
-    """
+    """Verify a face against stored embeddings and check location against employee's branch."""
     try:
-        # Save the uploaded photo to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_photo:
-            content = await photo.read()
-            temp_photo.write(content)
-            temp_photo_path = temp_photo.name
-
-        # Process the photo to detect faces
-        image = cv2.imread(temp_photo_path)
+        content = await photo.read()
+        result = process_face_verification(content, latitude, longitude, "verification")
         
-        # Clean up the temporary file
-        os.unlink(temp_photo_path)
+        if "status" in result:
+            return result
         
-        if image is None:
-            return {"status": "error", "message": "Invalid image file"}
-        
-        # Convert from BGR to RGB
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Detect faces
-        face_locations = face_recognition.face_locations(rgb_image)
-        if not face_locations:
-            return {"status": "error", "message": "No face detected in the image"}
-            
-        face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
-        if not face_encodings:
-            return {"status": "error", "message": "Could not generate face encoding"}
-        
-        # Get the first face encoding
-        face_encoding = face_encodings[0]
-        
-        # Search for similar embeddings
-        results = db_handler.vector_search(face_encoding)
-        if not results:
-            return {"status": "error", "message": "Face not recognized"}
-        
-        # Get the best match
-        best_match = results[0] 
-        entity_id = best_match["entity_id"]
-        name = best_match["name"]
-        
-        # Get branch location for this employee
-        employee_info = db_handler.get_employee_branch_location(entity_id)
-        if not employee_info:
-            return {"status": "error", "message": "Employee branch information not found"}
-        
-        # Check if employee is within the geofence of their branch
-        branch_latitude = employee_info["latitude"]
-        branch_longitude = employee_info["longitude"]
-        
-        distance = haversine(latitude, longitude, branch_latitude, branch_longitude)
-        if distance > MAX_DISTANCE:
-            return {
-                "status": "error",
-                "message": f"Location verification failed. You are {int(distance)}m away from your branch."
-            }
-            
         # All checks passed, return success
         return {
             "status": "success",
             "message": "Face and location verified successfully",
             "employee": {
-                "entity_id": entity_id,
-                "name": name,
-                "branch": employee_info["branch_name"],
-                "distance": int(distance)
+                "entity_id": result["entity_id"],
+                "name": result["name"],
+                "branch": result["employee_info"]["branch_name"],
+                "distance": result["distance"]
             }
         }
 
@@ -288,95 +293,40 @@ async def process_checkin(
     latitude: float = Form(...),
     longitude: float = Form(...)
 ):
-    """
-    Process check-in photo and validate against employee's branch location.
-    
-    Args:
-        photo: The photo to verify
-        latitude: Current latitude of the employee
-        longitude: Current longitude of the employee
-        
-    Returns:
-        Check-in status and employee details if successful
-    """
+    """Process check-in photo and validate against employee's branch location."""
     try:
-        # Save the uploaded photo to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_photo:
-            content = await photo.read()
-            temp_photo.write(content)
-            temp_photo_path = temp_photo.name
-
-        # Process the photo to detect faces
-        image = cv2.imread(temp_photo_path)
+        content = await photo.read()
+        result = process_face_verification(content, latitude, longitude, "check-in")
         
-        # Clean up the temporary file
-        os.unlink(temp_photo_path)
+        if "status" in result:
+            return result
         
-        if image is None:
-            return {"status": "error", "message": "Invalid image file"}
+        entity_id = result["entity_id"]
+        name = result["name"]
+        session_type = result["session_type"]
         
-        # Convert from BGR to RGB
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Detect faces
-        face_locations = face_recognition.face_locations(rgb_image)
-        if not face_locations:
-            return {"status": "error", "message": "No face detected in the image"}
-            
-        face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
-        if not face_encodings:
-            return {"status": "error", "message": "Could not generate face encoding"}
-        
-        # Get the first face encoding
-        face_encoding = face_encodings[0]
-        
-        # Search for similar embeddings
-        results = db_handler.vector_search(face_encoding)
-        if not results:
-            return {"status": "error", "message": "Face not recognized"}
-        
-        # Get the best match
-        best_match = results[0] 
-        entity_id = best_match["entity_id"]
-        name = best_match["name"]
-        
-        # Get branch location for this employee
-        employee_info = db_handler.get_employee_branch_location(entity_id)
-        if not employee_info:
-            return {"status": "error", "message": "Employee branch information not found"}
-        
-        # Check if employee is within the geofence of their branch
-        branch_latitude = employee_info["latitude"]
-        branch_longitude = employee_info["longitude"]
-        
-        distance = haversine(latitude, longitude, branch_latitude, branch_longitude)
-        if distance > MAX_DISTANCE:
-            return {
-                "status": "error",
-                "message": f"Location verification failed. You are {int(distance)}m away from your branch."
-            }
-        
-        # Check if the employee has already checked in today
-        if db_handler.has_checked_in_today(entity_id):
+        # Check if the employee has already checked in today for this session
+        if db_handler.has_checked_in_today(entity_id, session_type):
             return {
                 "status": "error", 
-                "message": f"{name} has already checked in today"
+                "message": f"{name} has already checked in for the {session_type} session today"
             }
 
         # Log the attendance
-        success = db_handler.log_attendance(entity_id, 'checkin', latitude, longitude)
+        success = db_handler.log_attendance(entity_id, 'checkin', latitude, longitude, session_type)
         if not success:
             return {"status": "error", "message": "Failed to log check-in"}
             
         # All checks passed, return success
         return {
             "status": "success",
-            "message": f"{name} checked in successfully!",
+            "message": f"{name} checked in successfully for the {session_type} session!",
             "employee": {
                 "entity_id": entity_id,
                 "name": name,
-                "branch": employee_info["branch_name"],
-                "distance": int(distance)
+                "branch": result["employee_info"]["branch_name"],
+                "distance": result["distance"],
+                "session_type": session_type
             }
         }
 
@@ -389,95 +339,40 @@ async def process_checkout(
     latitude: float = Form(...),
     longitude: float = Form(...)
 ):
-    """
-    Process check-out photo and validate against employee's branch location.
-    
-    Args:
-        photo: The photo to verify
-        latitude: Current latitude of the employee
-        longitude: Current longitude of the employee
-        
-    Returns:
-        Check-out status and employee details if successful
-    """
+    """Process check-out photo and validate against employee's branch location."""
     try:
-        # Save the uploaded photo to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_photo:
-            content = await photo.read()
-            temp_photo.write(content)
-            temp_photo_path = temp_photo.name
-
-        # Process the photo to detect faces
-        image = cv2.imread(temp_photo_path)
+        content = await photo.read()
+        result = process_face_verification(content, latitude, longitude, "check-out")
         
-        # Clean up the temporary file
-        os.unlink(temp_photo_path)
+        if "status" in result:
+            return result
         
-        if image is None:
-            return {"status": "error", "message": "Invalid image file"}
+        entity_id = result["entity_id"]
+        name = result["name"]
+        session_type = result["session_type"]
         
-        # Convert from BGR to RGB
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        # Detect faces
-        face_locations = face_recognition.face_locations(rgb_image)
-        if not face_locations:
-            return {"status": "error", "message": "No face detected in the image"}
-            
-        face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
-        if not face_encodings:
-            return {"status": "error", "message": "Could not generate face encoding"}
-        
-        # Get the first face encoding
-        face_encoding = face_encodings[0]
-        
-        # Search for similar embeddings
-        results = db_handler.vector_search(face_encoding)
-        if not results:
-            return {"status": "error", "message": "Face not recognized"}
-        
-        # Get the best match
-        best_match = results[0] 
-        entity_id = best_match["entity_id"]
-        name = best_match["name"]
-        
-        # Get branch location for this employee
-        employee_info = db_handler.get_employee_branch_location(entity_id)
-        if not employee_info:
-            return {"status": "error", "message": "Employee branch information not found"}
-        
-        # Check if employee is within the geofence of their branch
-        branch_latitude = employee_info["latitude"]
-        branch_longitude = employee_info["longitude"]
-        
-        distance = haversine(latitude, longitude, branch_latitude, branch_longitude)
-        if distance > MAX_DISTANCE:
-            return {
-                "status": "error",
-                "message": f"Location verification failed. You are {int(distance)}m away from your branch."
-            }
-        
-        # Check if the employee has already checked out today
-        if db_handler.has_checked_out_today(entity_id):
+        # Check if the employee has already checked out today for this session
+        if db_handler.has_checked_out_today(entity_id, session_type):
             return {
                 "status": "error", 
-                "message": f"{name} has already checked out today"
+                "message": f"{name} has already checked out for the {session_type} session today"
             }
 
         # Log the attendance
-        success = db_handler.log_attendance(entity_id, 'checkout', latitude, longitude)
+        success = db_handler.log_attendance(entity_id, 'checkout', latitude, longitude, session_type)
         if not success:
             return {"status": "error", "message": "Failed to log check-out"}
             
         # All checks passed, return success
         return {
             "status": "success",
-            "message": f"{name} checked out successfully!",
+            "message": f"{name} checked out successfully for the {session_type} session!",
             "employee": {
                 "entity_id": entity_id,
                 "name": name,
-                "branch": employee_info["branch_name"],
-                "distance": int(distance)
+                "branch": result["employee_info"]["branch_name"],
+                "distance": result["distance"],
+                "session_type": session_type
             }
         }
 
@@ -813,12 +708,25 @@ async def today_attendance_summary():
             cur.execute("""
                 SELECT COUNT(DISTINCT entity_id) 
                 FROM attendance 
-                WHERE event_type = 'checkin' AND DATE(event_time) = %s
+                WHERE event_type = 'checkin' 
+                  AND session_type = 'morning'
+                  AND DATE(event_time) = %s
             """, (today,))
-            today_count = cur.fetchone()[0]
+            morning_count = cur.fetchone()[0]
             
-            # Calculate today's percentage
-            today_percentage = (today_count / total_employees) * 100 if total_employees > 0 else 0
+            # Count unique employees who checked in today for afternoon session
+            cur.execute("""
+                SELECT COUNT(DISTINCT entity_id) 
+                FROM attendance 
+                WHERE event_type = 'checkin' 
+                  AND session_type = 'afternoon'
+                  AND DATE(event_time) = %s
+            """, (today,))
+            afternoon_count = cur.fetchone()[0]
+            
+            # Calculate percentages
+            morning_percentage = (morning_count / total_employees) * 100 if total_employees > 0 else 0
+            afternoon_percentage = (afternoon_count / total_employees) * 100 if total_employees > 0 else 0
             
             # Get weekly average (last 7 days)
             one_week_ago = today - timedelta(days=7)
@@ -826,26 +734,45 @@ async def today_attendance_summary():
                 WITH daily_counts AS (
                     SELECT 
                         DATE(event_time) as attendance_date,
+                        session_type,
                         COUNT(DISTINCT entity_id) as daily_count
                     FROM attendance
                     WHERE 
                         event_type = 'checkin' AND 
                         DATE(event_time) BETWEEN %s AND %s
-                    GROUP BY DATE(event_time)
+                    GROUP BY DATE(event_time), session_type
                 )
-                SELECT AVG(daily_count) as weekly_avg
+                SELECT 
+                    session_type,
+                    AVG(daily_count) as weekly_avg
                 FROM daily_counts
+                GROUP BY session_type
             """, (one_week_ago, today))
             
-            result = cur.fetchone()
-            weekly_avg_count = result[0] if result and result[0] is not None else 0
-            weekly_avg_percentage = (weekly_avg_count / total_employees) * 100 if total_employees > 0 else 0
+            results = cur.fetchall()
+            weekly_avg_counts = {}
+            for session_type, avg_count in results:
+                weekly_avg_counts[session_type] = avg_count if avg_count is not None else 0
+            
+            weekly_avg_percentages = {
+                session_type: (avg_count / total_employees) * 100 if total_employees > 0 else 0
+                for session_type, avg_count in weekly_avg_counts.items()
+            }
             
         return {
             "status": "success",
-            "count": today_count,
-            "percentage": round(today_percentage, 1),
-            "weeklyAverage": round(weekly_avg_percentage, 1)
+            "morning": {
+                "count": morning_count,
+                "percentage": round(morning_percentage, 1)
+            },
+            "afternoon": {
+                "count": afternoon_count,
+                "percentage": round(afternoon_percentage, 1)
+            },
+            "weeklyAverage": {
+                "morning": round(weekly_avg_percentages.get("morning", 0), 1),
+                "afternoon": round(weekly_avg_percentages.get("afternoon", 0), 1)
+            }
         }
     except Exception as e:
         return {"status": "error", "message": f"Error retrieving attendance summary: {str(e)}"}
@@ -866,6 +793,7 @@ async def get_recent_activities():
                     a.entity_id,
                     e.name,
                     a.event_type,
+                    a.session_type,
                     a.event_time,
                     b.branch_name
                 FROM 
@@ -884,16 +812,16 @@ async def get_recent_activities():
             # Format the activities
             activities = []
             for event in attendance_events:
-                entity_id, name, event_type, event_time, branch_name = event
+                entity_id, name, event_type, session_type, event_time, branch_name = event
                 
                 if event_type == 'checkin':
                     activity_type = 'check-in'
                     color = 'green'
-                    description = f"{name} checked in at {branch_name}"
+                    description = f"{name} checked in for {session_type} session at {branch_name}"
                 else:
                     activity_type = 'check-out'
                     color = 'red'
-                    description = f"{name} checked out from {branch_name}"
+                    description = f"{name} checked out from {session_type} session at {branch_name}"
                 
                 activities.append({
                     "id": f"{entity_id}-{event_time.isoformat()}",
@@ -901,7 +829,8 @@ async def get_recent_activities():
                     "color": color,
                     "description": description,
                     "timestamp": event_time.isoformat(),
-                    "timeFormatted": event_time.strftime("%Y-%m-%d %H:%M:%S")
+                    "timeFormatted": event_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "session_type": session_type
                 })
             
             # Also get new employee enrollments (based on creation time in face_embeddings)
@@ -1010,22 +939,36 @@ async def get_attendance_report(startDate: str = None, endDate: str = None):
                 daily_counts AS (
                     SELECT 
                         DATE(event_time) as attendance_date,
+                        session_type,
                         COUNT(DISTINCT entity_id) as check_in_count
                     FROM attendance
                     WHERE 
                         event_type = 'checkin' AND 
                         DATE(event_time) BETWEEN %s AND %s
-                    GROUP BY DATE(event_time)
+                    GROUP BY DATE(event_time), session_type
                 )
                 SELECT 
                     dr.day,
+                    'morning' as session_type,
                     COALESCE(dc.check_in_count, 0) as check_in_count
                 FROM 
                     date_range dr
                 LEFT JOIN 
-                    daily_counts dc ON dr.day = dc.attendance_date
+                    daily_counts dc ON dr.day = dc.attendance_date AND dc.session_type = 'morning'
+                
+                UNION ALL
+                
+                SELECT 
+                    dr.day,
+                    'afternoon' as session_type,
+                    COALESCE(dc.check_in_count, 0) as check_in_count
+                FROM 
+                    date_range dr
+                LEFT JOIN 
+                    daily_counts dc ON dr.day = dc.attendance_date AND dc.session_type = 'afternoon'
+                
                 ORDER BY 
-                    dr.day
+                    dr.day, session_type
             """, (start_date, end_date, start_date, end_date))
             
             daily_data = cur.fetchall()
@@ -1034,20 +977,41 @@ async def get_attendance_report(startDate: str = None, endDate: str = None):
             formatted_daily_data = []
             total_attendance = 0
             
+            current_date = None
+            current_day_data = {}
+            
             for day_data in daily_data:
-                day, count = day_data
+                day, session_type, count = day_data
+                
+                if current_date != day:
+                    if current_date is not None:
+                        formatted_daily_data.append(current_day_data)
+                    current_date = day
+                    current_day_data = {
+                        "date": day.strftime("%Y-%m-%d"),
+                        "morning": {
+                            "count": 0,
+                            "percentage": 0
+                        },
+                        "afternoon": {
+                            "count": 0,
+                            "percentage": 0
+                        }
+                    }
+                
                 percentage = (count / total_employees) * 100 if total_employees > 0 else 0
                 total_attendance += count
                 
-                formatted_daily_data.append({
-                    "date": day.strftime("%Y-%m-%d"),
-                    "count": count,
-                    "percentage": round(percentage, 1)
-                })
+                current_day_data[session_type]["count"] = count
+                current_day_data[session_type]["percentage"] = round(percentage, 1)
+            
+            # Add the last day
+            if current_date is not None:
+                formatted_daily_data.append(current_day_data)
             
             # Calculate summary statistics
             total_days = (end_date - start_date).days + 1
-            avg_attendance = total_attendance / total_days if total_days > 0 else 0
+            avg_attendance = total_attendance / (total_days * 2) if total_days > 0 else 0  # Multiply by 2 for morning and afternoon
             avg_percentage = (avg_attendance / total_employees) * 100 if total_employees > 0 else 0
             
             # Get top branches by attendance
@@ -1108,3 +1072,376 @@ async def shutdown_event():
             db_handler.close()
     except Exception as e:
         print(f"Error during shutdown: {e}")
+
+@app.get("/attendance/daily-report")
+async def get_daily_attendance_report(
+    date: str,
+    branch: str = None,
+    search: str = None
+):
+    """
+    Get daily attendance report with optional filtering by branch and search term.
+    
+    Args:
+        date: Date in YYYY-MM-DD format
+        branch: Optional branch name to filter by
+        search: Optional search term to filter by name or employee ID
+        
+    Returns:
+        List of attendance records for the specified date
+    """
+    try:
+        with db_handler.conn.cursor() as cur:
+            # Base query with joins to get all necessary information
+            query = """
+                SELECT 
+                    a.entity_id,
+                    e.name,
+                    b.branch_name,
+                    a.event_time,
+                    a.event_type,
+                    a.session_type
+                FROM 
+                    attendance a
+                JOIN 
+                    face_embeddings e ON a.entity_id = e.entity_id
+                JOIN 
+                    branches b ON e.branch_id = b.branch_id
+                WHERE 
+                    DATE(a.event_time) = %s
+            """
+            params = [date]
+            
+            # Add branch filter if specified
+            if branch and branch != "All Branches":
+                query += " AND b.branch_name = %s"
+                params.append(branch)
+            
+            # Add search filter if specified
+            if search:
+                query += " AND (e.name ILIKE %s OR a.entity_id ILIKE %s)"
+                search_term = f"%{search}%"
+                params.extend([search_term, search_term])
+            
+            query += " ORDER BY a.event_time"
+            
+            cur.execute(query, params)
+            records = cur.fetchall()
+            
+            # Process records to group check-ins and check-outs
+            attendance_data = {}
+            for record in records:
+                entity_id, name, branch_name, event_time, event_type, session_type = record
+                
+                if entity_id not in attendance_data:
+                    attendance_data[entity_id] = {
+                        "entity_id": entity_id,
+                        "name": name,
+                        "branch_name": branch_name,
+                        "checkIn": None,
+                        "checkOut": None,
+                        "session_type": session_type
+                    }
+                
+                if event_type == "checkin":
+                    attendance_data[entity_id]["checkIn"] = event_time.isoformat()
+                elif event_type == "checkout":
+                    attendance_data[entity_id]["checkOut"] = event_time.isoformat()
+            
+            return {
+                "status": "success",
+                "records": list(attendance_data.values())
+            }
+            
+    except Exception as e:
+        return {"status": "error", "message": f"Error retrieving daily attendance report: {str(e)}"}
+
+@app.get("/attendance/weekly-report")
+async def get_weekly_attendance_report(
+    start_date: str,
+    end_date: str,
+    branch: str = None,
+    search: str = None
+):
+    """
+    Get weekly attendance report with summary statistics and optional filtering.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+        branch: Optional branch name to filter by
+        search: Optional search term to filter by name or employee ID
+        
+    Returns:
+        Weekly attendance summary and detailed records
+    """
+    try:
+        with db_handler.conn.cursor() as cur:
+            # Get total number of employees
+            cur.execute("SELECT COUNT(*) FROM face_embeddings")
+            total_employees = cur.fetchone()[0]
+            
+            # Get total number of working days in the period
+            cur.execute("""
+                SELECT COUNT(DISTINCT DATE(event_time))
+                FROM attendance
+                WHERE DATE(event_time) BETWEEN %s AND %s
+            """, (start_date, end_date))
+            total_days = cur.fetchone()[0] or 1  # Avoid division by zero
+            
+            # Base query for attendance records
+            query = """
+                WITH employee_attendance AS (
+                    SELECT 
+                        a.entity_id,
+                        e.name,
+                        b.branch_name,
+                        COUNT(DISTINCT DATE(a.event_time)) as present_days,
+                        COUNT(DISTINCT CASE WHEN a.event_type = 'checkin' THEN DATE(a.event_time) END) as checkin_days
+                    FROM 
+                        attendance a
+                    JOIN 
+                        face_embeddings e ON a.entity_id = e.entity_id
+                    JOIN 
+                        branches b ON e.branch_id = b.branch_id
+                    WHERE 
+                        DATE(a.event_time) BETWEEN %s AND %s
+            """
+            params = [start_date, end_date]
+            
+            # Add branch filter if specified
+            if branch and branch != "All Branches":
+                query += " AND b.branch_name = %s"
+                params.append(branch)
+            
+            # Add search filter if specified
+            if search:
+                query += " AND (e.name ILIKE %s OR a.entity_id ILIKE %s)"
+                search_term = f"%{search}%"
+                params.extend([search_term, search_term])
+            
+            query += """
+                    GROUP BY a.entity_id, e.name, b.branch_name
+                )
+                SELECT 
+                    entity_id,
+                    name,
+                    branch_name,
+                    present_days,
+                    ROUND((present_days::float / %s) * 100, 1) as attendance_rate
+                FROM 
+                    employee_attendance
+                ORDER BY 
+                    attendance_rate DESC, name
+            """
+            params.append(total_days)
+            
+            cur.execute(query, params)
+            records = cur.fetchall()
+            
+            # Calculate summary statistics
+            total_present = sum(record[3] for record in records)  # present_days
+            avg_attendance_rate = sum(record[4] for record in records) / len(records) if records else 0
+            
+            # Get weekly average (last 7 days)
+            cur.execute("""
+                SELECT 
+                    COUNT(DISTINCT entity_id)::float / NULLIF((SELECT COUNT(*) FROM face_embeddings), 0) * 100
+                FROM attendance
+                WHERE DATE(event_time) >= CURRENT_DATE - INTERVAL '7 days'
+                AND event_type = 'checkin'
+            """)
+            weekly_average = cur.fetchone()[0] or 0
+            
+            return {
+                "status": "success",
+                "summary": {
+                    "count": total_present,
+                    "percentage": round(avg_attendance_rate, 1),
+                    "weeklyAverage": round(weekly_average, 1)
+                },
+                "records": [
+                    {
+                        "entity_id": record[0],
+                        "name": record[1],
+                        "branch_name": record[2],
+                        "presentDays": record[3],
+                        "attendanceRate": record[4]
+                    }
+                    for record in records
+                ]
+            }
+            
+    except Exception as e:
+        return {"status": "error", "message": f"Error retrieving weekly attendance report: {str(e)}"}
+
+@app.get("/attendance/export")
+async def export_attendance(
+    start_date: str,
+    end_date: str,
+    report_type: str = "daily",
+    branch: str = None
+):
+    """
+    Export attendance data to CSV format.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+        report_type: Type of report ('daily' or 'weekly')
+        branch: Optional branch name to filter by
+        
+    Returns:
+        CSV file containing attendance data
+    """
+    try:
+        with db_handler.conn.cursor() as cur:
+            if report_type == "daily":
+                # Query for daily report
+                query = """
+                    SELECT 
+                        a.entity_id,
+                        e.name,
+                        b.branch_name,
+                        DATE(a.event_time) as date,
+                        a.session_type,
+                        MIN(CASE WHEN a.event_type = 'checkin' THEN a.event_time END) as checkin_time,
+                        MAX(CASE WHEN a.event_type = 'checkout' THEN a.event_time END) as checkout_time
+                    FROM 
+                        attendance a
+                    JOIN 
+                        face_embeddings e ON a.entity_id = e.entity_id
+                    JOIN 
+                        branches b ON e.branch_id = b.branch_id
+                    WHERE 
+                        DATE(a.event_time) BETWEEN %s AND %s
+                """
+            else:
+                # Query for weekly report
+                query = """
+                    WITH employee_attendance AS (
+                        SELECT 
+                            a.entity_id,
+                            e.name,
+                            b.branch_name,
+                            COUNT(DISTINCT DATE(a.event_time)) as present_days,
+                            COUNT(DISTINCT CASE WHEN a.event_type = 'checkin' THEN DATE(a.event_time) END) as checkin_days
+                        FROM 
+                            attendance a
+                        JOIN 
+                            face_embeddings e ON a.entity_id = e.entity_id
+                        JOIN 
+                            branches b ON e.branch_id = b.branch_id
+                        WHERE 
+                            DATE(a.event_time) BETWEEN %s AND %s
+                """
+            
+            params = [start_date, end_date]
+            
+            # Add branch filter if specified
+            if branch and branch != "All Branches":
+                query += " AND b.branch_name = %s"
+                params.append(branch)
+            
+            if report_type == "daily":
+                query += """
+                    GROUP BY a.entity_id, e.name, b.branch_name, DATE(a.event_time), a.session_type
+                    ORDER BY date, name
+                """
+            else:
+                query += """
+                        GROUP BY a.entity_id, e.name, b.branch_name
+                    )
+                    SELECT 
+                        entity_id,
+                        name,
+                        branch_name,
+                        present_days,
+                        ROUND((present_days::float / (SELECT COUNT(DISTINCT DATE(event_time)) FROM attendance WHERE DATE(event_time) BETWEEN %s AND %s)) * 100, 1) as attendance_rate
+                    FROM 
+                        employee_attendance
+                    ORDER BY 
+                        attendance_rate DESC, name
+                """
+                params.extend([start_date, end_date])
+            
+            cur.execute(query, params)
+            records = cur.fetchall()
+            
+            # Create CSV file in memory
+            output = io.StringIO()
+            writer = csv.writer(output)
+            
+            if report_type == "daily":
+                # Write daily report headers
+                writer.writerow([
+                    "Employee ID",
+                    "Name",
+                    "Branch",
+                    "Date",
+                    "Session",
+                    "Check-in Time",
+                    "Check-out Time"
+                ])
+                
+                # Write daily report data
+                for record in records:
+                    writer.writerow([
+                        record[0],  # entity_id
+                        record[1],  # name
+                        record[2],  # branch_name
+                        record[3],  # date
+                        record[4],  # session_type
+                        record[5].strftime("%H:%M:%S") if record[5] else "N/A",  # checkin_time
+                        record[6].strftime("%H:%M:%S") if record[6] else "N/A"   # checkout_time
+                    ])
+            else:
+                # Write weekly report headers
+                writer.writerow([
+                    "Employee ID",
+                    "Name",
+                    "Branch",
+                    "Present Days",
+                    "Attendance Rate (%)"
+                ])
+                
+                # Write weekly report data
+                for record in records:
+                    writer.writerow([
+                        record[0],  # entity_id
+                        record[1],  # name
+                        record[2],  # branch_name
+                        record[3],  # present_days
+                        record[4]   # attendance_rate
+                    ])
+            
+            # Prepare the response
+            output.seek(0)
+            return StreamingResponse(
+                iter([output.getvalue()]),
+                media_type="text/csv",
+                headers={
+                    "Content-Disposition": f"attachment; filename=attendance_report_{start_date}_to_{end_date}.csv"
+                }
+            )
+            
+    except Exception as e:
+        return {"status": "error", "message": f"Error exporting attendance data: {str(e)}"}
+    
+@app.post("/forgot-password")
+async def update_password(
+    username: str = Form(...),
+    new_password: str = Form(...)
+):
+    """
+    Update password for a given username.
+    """
+    try:
+        password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+        success = db_handler.forgot_password(username, password_hash)
+        if success:
+            return {"status": "success", "message": "Password updated successfully"}
+        else:
+            return {"status": "error", "message": "Username not found or update failed"}
+    except Exception as e:
+        return {"status": "error", "message": f"Error updating password: {str(e)}"}

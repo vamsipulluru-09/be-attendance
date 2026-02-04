@@ -87,6 +87,7 @@ class FaceEmbeddingDB:
                 id SERIAL PRIMARY KEY,
                 entity_id VARCHAR(255) NOT NULL,
                 event_type VARCHAR(10) NOT NULL,
+                session_type VARCHAR(10) NOT NULL,
                 event_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 latitude FLOAT NOT NULL,
                 longitude FLOAT NOT NULL,
@@ -243,8 +244,8 @@ class FaceEmbeddingDB:
             print(f"Error retrieving branches: {e}")
             return []
 
-    def has_checked_in_today(self, entity_id: str) -> bool:
-        """Check if an employee has already checked in today."""
+    def has_checked_in_today(self, entity_id: str, session_type: str) -> bool:
+        """Check if an employee has already checked in today for a specific session."""
         today = datetime.now().date()
         try:
             with self.conn.cursor() as cur:
@@ -253,15 +254,16 @@ class FaceEmbeddingDB:
                     FROM attendance
                     WHERE entity_id = %s
                       AND event_type = 'checkin'
+                      AND session_type = %s
                       AND DATE(event_time) = %s
-                """, (entity_id, today))
+                """, (entity_id, session_type, today))
                 return cur.fetchone() is not None
         except Exception as e:
             print(f"Error checking if user has checked in today: {e}")
             return False
 
-    def has_checked_out_today(self, entity_id: str) -> bool:
-        """Check if an employee has already checked out today."""
+    def has_checked_out_today(self, entity_id: str, session_type: str) -> bool:
+        """Check if an employee has already checked out today for a specific session."""
         today = datetime.now().date()
         try:
             with self.conn.cursor() as cur:
@@ -270,21 +272,22 @@ class FaceEmbeddingDB:
                     FROM attendance
                     WHERE entity_id = %s
                       AND event_type = 'checkout'
+                      AND session_type = %s
                       AND DATE(event_time) = %s
-                """, (entity_id, today))
+                """, (entity_id, session_type, today))
                 return cur.fetchone() is not None
         except Exception as e:
             print(f"Error checking if user has checked out today: {e}")
             return False
 
-    def log_attendance(self, entity_id: str, event_type: str, latitude: float, longitude: float) -> bool:
+    def log_attendance(self, entity_id: str, event_type: str, latitude: float, longitude: float, session_type: str) -> bool:
         """Log attendance event for an employee."""
         try:
             with self.conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO attendance (entity_id, event_type, latitude, longitude)
-                    VALUES (%s, %s, %s, %s)
-                """, (entity_id, event_type, latitude, longitude))
+                    INSERT INTO attendance (entity_id, event_type, session_type, latitude, longitude)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (entity_id, event_type, session_type, latitude, longitude))
                 self.conn.commit()
                 return True
         except Exception as e:
@@ -326,18 +329,20 @@ class FaceEmbeddingDB:
                     WITH daily_attendance AS (
                         SELECT
                             DATE(event_time) as attendance_date,
+                            session_type,
                             MAX(CASE WHEN event_type = 'checkin' THEN event_time END) as checkin_time,
                             MAX(CASE WHEN event_type = 'checkout' THEN event_time END) as checkout_time
                         FROM attendance
                         WHERE entity_id = %s
-                        GROUP BY DATE(event_time)
+                        GROUP BY DATE(event_time), session_type
                     )
                     SELECT
                         attendance_date,
+                        session_type,
                         checkin_time,
                         checkout_time
                     FROM daily_attendance
-                    ORDER BY attendance_date DESC;
+                    ORDER BY attendance_date DESC, session_type;
                 """
                 cur.execute(query, (entity_id,))
                 results = cur.fetchall()
@@ -345,8 +350,9 @@ class FaceEmbeddingDB:
                 return [
                     {
                         "date": row[0],
-                        "checkin_time": row[1],
-                        "checkout_time": row[2]
+                        "session_type": row[1],
+                        "checkin_time": row[2],
+                        "checkout_time": row[3]
                     }
                     for row in results
                 ]
@@ -545,6 +551,18 @@ class FaceEmbeddingDB:
                 return cur.fetchone() is not None
         except Exception as e:
             print(f"Error verifying admin credentials: {e}")
+            return False
+
+    def forgot_password(self, username, new_password_hash):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE admins SET password_hash = %s WHERE username = %s",
+                    (new_password_hash, username)
+                )
+                self.conn.commit()
+                return cur.rowcount > 0
+        except Exception:
             return False
 
     
