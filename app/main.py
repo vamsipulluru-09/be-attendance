@@ -514,44 +514,41 @@ async def get_user_report(entity_id: str):
         }
         
 @app.post("/create-admin")
-async def create_admin(request: Request):
+async def create_admin(email: str = Form(...), passcode: str = Form(...)):
+    """
+    Create a new admin by sending a verification email.
+    
+    Args:
+        email: Email address for the new admin
+        passcode: Security passcode to authorize admin creation
+        
+    Returns:
+        Status of admin creation request
+    """
     try:
-        data = await request.json()
-        email = data.get("email")
-        passcode = data.get("passcode")
-
-        if not email or not passcode:
-            raise HTTPException(status_code=400, detail="Email and passcode are required")
-
-        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-            raise HTTPException(status_code=400, detail="Invalid email format")
-
-        if passcode != os.getenv("ADMIN_PASSCODE"):
+        # Verify passcode
+        if passcode != ADMIN_PASSCODE:
             raise HTTPException(status_code=401, detail="Invalid passcode")
-
-        try:
-            token = db_handler.create_admin_verification_token(email)
-            if not token:
-                raise HTTPException(status_code=500, detail="Failed to create verification token")
-
-            # Send verification email
-            if not face_processor.send_admin_verification_email(email, token):
-                raise HTTPException(status_code=500, detail="Failed to send verification email")
-
-            return {"message": "Verification email sent successfully"}
-        except OperationalError as e:
-            print(f"Database operational error: {e}")
-            # Try to reconnect
-            db_handler.connect()
-            raise HTTPException(status_code=503, detail="Database connection error. Please try again.")
-        except Exception as e:
-            print(f"Error in create-admin: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-    except HTTPException:
-        raise
+        
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            return {"status": "error", "message": "Invalid email format"}
+        
+        token = db_handler.create_admin_verification_token(email)
+        if not token:
+            return {"status": "error", "message": "Failed to create verification token"}
+        
+        email_sent = face_processor.send_admin_verification_email(email, token)
+        if not email_sent:
+            return {"status": "error", "message": "Failed to send verification email"}
+            
+        return {
+            "status": "success",
+            "message": f"Verification email sent to {email}. Please check your email to complete admin setup."
+        }
+    except HTTPException as e:
+        return {"status": "error", "message": e.detail, "status_code": e.status_code}
     except Exception as e:
-        print(f"Unexpected error in create-admin: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        return {"status": "error", "message": f"Error creating admin: {str(e)}"}
 
 @app.post("/verify-admin-token")
 async def verify_admin(
